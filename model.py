@@ -4,6 +4,7 @@ from torch import nn
 import torch
 import math
 from torch.nn import functional as F
+import inspect
 
 
 @dataclass
@@ -17,6 +18,7 @@ class ModelArgs:
     hidden_dim: Optional[int] = None 
     multiple_of: int = 256  # MLP hidden layer will be multiple of this number
     dropout: float = 0.0
+    norm_eps: float = 1e-5
     max_seq_len: int = 2048
 
     flash = False  # If True, use Pytorch Attention instead of the manual implementation.
@@ -137,7 +139,7 @@ class Attention(nn.Module):
         if self.flash:  # Use PyTorch Implemention.
             output = torch.nn.functional.sacale_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_casual=True)
         else:  # Use Manual Implemention.
-            score = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+            scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, "mask")
             scores = scores + self.mask[:, :, :seqlen, :seqlen]
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
@@ -178,7 +180,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.w2(F.gelu(self.w1(x))) + self.w3(x))
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -272,3 +274,29 @@ class Transformer(nn.Module):
             self.last_loss = None
 
         return logits
+    
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no weight decay.
+        # i.e. all weight tensors in matmuls + embeddings decay, all bias and layernorms do not decay.
+        decay_params = [p for n, p in param_dict.items() if len(p.shape) >= 2]
+        nondecay_params = [p for n, p in param_dict.items() if len(p.shape) < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nondecay_params, 'weight_decay': 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nondecay_params = sum(p.numel() for p in nondecay_params)
+        print(f"number of params: {num_decay_params + num_nondecay_params}")
+        print(f"number of decay params: {num_decay_params}")
+        print(f"number of non-decay params: {num_nondecay_params}")
+
+        # create optimizer
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == "cuda"
+        extra_args = dict(fused=True) if use_fused else {}
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        print(f"using fused adam: {use_fused}")
+
+        return optimizer
